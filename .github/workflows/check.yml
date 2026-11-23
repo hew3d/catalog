@@ -1,0 +1,101 @@
+# Runs `hew-cli catalog check` on each source reference a pull request adds
+# to library.json or plugins.json.
+#
+# hew-cli comes from the standalone archive the Hew release publishes
+# (hew-cli-v<version>-linux-x86_64.tar.gz plus its .sha256), verified before
+# it runs. HEW_CLI_VERSION names the first Hew release that carries those
+# archives, so the workflow starts working once that tag exists; until then
+# the download step fails.
+name: Check listing
+
+on:
+  pull_request:
+    paths:
+      - library.json
+      - plugins.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  HEW_CLI_VERSION: "1.5.0-pre.4"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the lists are sorted and unique
+        run: |
+          failed=0
+          for file in library.json plugins.json; do
+            [ -f "$file" ] || continue
+            if ! jq -e '. == (sort | unique)' "$file" > /dev/null; then
+              echo "::error file=$file::$file must be sorted and have no duplicate entries"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Fetch hew-cli
+        run: |
+          base="https://github.com/hew3d/hew/releases/download/v${HEW_CLI_VERSION}"
+          asset="hew-cli-v${HEW_CLI_VERSION}-linux-x86_64.tar.gz"
+          dir="$RUNNER_TEMP/hew-cli"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/$asset" "$base/$asset"
+          curl -fsSL -o "$dir/$asset.sha256" "$base/$asset.sha256"
+          (cd "$dir" && sha256sum -c "$asset.sha256")
+          tar -xzf "$dir/$asset" -C "$dir" hew-cli
+          chmod +x "$dir/hew-cli"
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/hew-cli" --version
+
+      - name: Check each added reference
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          # The checkout is the merge ref; its first parent is the base the
+          # merge was computed against, so a base that moved on since the PR
+          # branched cannot show its own additions as this PR's.
+          BASE_SHA=$(git rev-parse HEAD^1)
+          failed=0
+          for file in library.json plugins.json; do
+            if git cat-file -e "$BASE_SHA:$file" 2>/dev/null; then
+              git show "$BASE_SHA:$file" > "$RUNNER_TEMP/base.json"
+            else
+              echo '[]' > "$RUNNER_TEMP/base.json"
+            fi
+            # References in this file that the base does not have, one JSON
+            # string per line so a newline inside a reference survives. The
+            # references are untrusted pull request data: each is held in a
+            # quoted variable, passed after `--`, and never expanded by the
+            # shell or evaluated.
+            jq -c --slurpfile base "$RUNNER_TEMP/base.json" \
+              '.[] | select(. as $r | $base[0] | index($r) | not)' "$file" \
+              > "$RUNNER_TEMP/added.txt"
+            while IFS= read -r encoded; do
+              [ -n "$encoded" ] || continue
+              ref="$(printf '%s' "$encoded" | jq -rj .)"
+              echo "== $file: $encoded"
+              if ! out="$("$RUNNER_TEMP/hew-cli/hew-cli" catalog check -- "$ref")"; then
+                failed=1
+                while IFS= read -r line; do
+                  echo "::error file=$file::$encoded: $line"
+                done <<< "$out"
+              fi
+              if [ -n "$out" ]; then echo "$out"; fi
+            done < "$RUNNER_TEMP/added.txt"
+          done
+          exit "$failed"

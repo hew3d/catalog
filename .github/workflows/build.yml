@@ -1,0 +1,97 @@
+# Runs `hew-cli catalog build` and commits the output (catalog.json and
+# sources/) to the `data` branch.
+#
+# hew-cli comes from the standalone archive the Hew release publishes
+# (hew-cli-v<version>-linux-x86_64.tar.gz plus its .sha256), verified before
+# it runs. HEW_CLI_VERSION names the first Hew release that carries those
+# archives, so the workflow starts working once that tag exists; until then
+# the download step fails.
+name: Build catalog
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-catalog
+  cancel-in-progress: false
+
+env:
+  HEW_CLI_VERSION: "1.5.0-pre.4"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: main
+          persist-credentials: false
+
+      - name: Fetch hew-cli
+        run: |
+          base="https://github.com/hew3d/hew/releases/download/v${HEW_CLI_VERSION}"
+          asset="hew-cli-v${HEW_CLI_VERSION}-linux-x86_64.tar.gz"
+          dir="$RUNNER_TEMP/hew-cli"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/$asset" "$base/$asset"
+          curl -fsSL -o "$dir/$asset.sha256" "$base/$asset.sha256"
+          (cd "$dir" && sha256sum -c "$asset.sha256")
+          tar -xzf "$dir/$asset" -C "$dir" hew-cli
+          chmod +x "$dir/hew-cli"
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/hew-cli" --version
+
+      # The data branch holds only generated files. It is created on the
+      # first run, as an orphan, when it does not exist yet.
+      - name: Check out data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          rm -rf data
+          if git ls-remote --exit-code --heads "https://github.com/$REPO.git" data > /dev/null; then
+            git clone --quiet --branch data --single-branch \
+              "https://x-access-token:${GH_TOKEN}@github.com/$REPO.git" data
+          else
+            git init --quiet --initial-branch=data data
+            git -C data remote add origin "https://x-access-token:${GH_TOKEN}@github.com/$REPO.git"
+          fi
+
+      - name: Build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          # --previous lets a source that fails this run keep its last snapshot.
+          "$RUNNER_TEMP/hew-cli/hew-cli" catalog build main \
+            --out "$RUNNER_TEMP/out" --previous data
+
+      - name: Commit to data
+        run: |
+          cd data
+          git rm -rq --ignore-unmatch catalog.json sources
+          cp "$RUNNER_TEMP/out/catalog.json" catalog.json
+          if [ -d "$RUNNER_TEMP/out/sources" ]; then
+            cp -R "$RUNNER_TEMP/out/sources" sources
+          fi
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No change to the catalog."
+            exit 0
+          fi
+          git config user.name "catalog-build"
+          git config user.email "catalog-build@users.noreply.github.com"
+          git commit -q -m "chore: rebuild the catalog"
+          git push origin HEAD:data
